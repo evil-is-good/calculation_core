@@ -1,0 +1,162 @@
+/*! \page hcpoc Задача теплопроводности на ячейке
+ \section hcpsoc1 Необходимые заголовки.
+ Заголовки дила.
+ @code
+#include <deal.II/fe/fe_q.h>
+#include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/precondition.h>
+ @endcode
+ Заголовки выч ядра.
+ @code
+#include "../../../calculation_core/src/blocks/general/domain/domain.h"
+#include "../../../calculation_core/src/blocks/general/laplacian/scalar/laplacian_scalar.h"
+#include "../../../calculation_core/src/blocks/general/boundary_value/boundary_value.h"
+#include "../../../calculation_core/src/blocks/general/additional_tools/trivial_prepare_system_equations/trivial_prepare_system_equations.h"
+#include "../../../calculation_core/src/blocks/general/additional_tools/apply_boundary_value/scalar/apply_boundary_value_scalar.h"
+#include "../../../calculation_core/src/blocks/general/geometric_tools/geometric_tools.h"
+#include "../../../calculation_core/src/blocks/special/heat_conduction_problem_tools/heat_conduction_problem_tools.h"
+
+#include "../../../calculation_core/src/blocks/special/problem_on_cell/source/scalar/source_scalar.h"
+#include "../../../calculation_core/src/blocks/special/problem_on_cell/prepare_system_equations/prepare_system_equations.h"
+#include "../../../calculation_core/src/blocks/special/problem_on_cell/system_linear_algebraic_equations/system_linear_algebraic_equations.h"
+#include "../../../calculation_core/src/blocks/special/problem_on_cell/calculate_meta_coefficients/calculate_meta_coefficients.h"
+#include "../../../calculation_core/src/blocks/special/problem_on_cell/assembler/assembler.h"
+ @endcode
+ 
+ \section hcpsoc2 Дополнительные инструменты.
+ @code
+extern void set_grid(
+        dealii::Triangulation< 2 >&,
+        vec<prmt::Point<2>>,
+        vec<prmt::Point<2>>);
+ @endcode
+ Это функция для построения триангуляции области описана в файле grid.cpp, а так как он компилируется отдельно, то суда функция только импортируется. \n
+ Второй параметр - точки внешней граници. Третий - точки граници включения.
+
+ \section hcpsoc3 Собственно сам код.
+ @code
+int main()
+{
+    enum {x, y};
+ @endcode
+ Задаём домен. Это треангуляция и список степеней свободы.
+ @code
+        Domain<2> domain;
+@endcode
+Генерируем триангуляцию. Область надо задавать в виде прямоугольника, а форма включения произвольная.
+ @code
+        {
+            vec<prmt::Point<2>> outer(4); // внешняя граница
+            vec<prmt::Point<2>> inner(4); // граница включения
+
+            outer[0].x() = 0.0; outer[0].y() = 0.0;
+            outer[1].x() = 1.0; outer[1].y() = 0.0;
+            outer[2].x() = 1.0; outer[2].y() = 1.0;
+            outer[3].x() = 0.0; outer[3].y() = 1.0;
+
+            inner[0].x() = 0.25; inner[0].y() = 0.25;
+            inner[1].x() = 0.75; inner[1].y() = 0.25;
+            inner[2].x() = 0.75; inner[2].y() = 0.75;
+            inner[3].x() = 0.25; inner[3].y() = 0.75;
+
+            set_grid (domain.grid, outer, inner);
+            
+            domain.grid.refine_global(1); // Згустить сетку в 2 раза
+        };
+@endcode
+Задаём тип граничных элкментов.
+ @code
+        dealii::FE_Q<2> fe(1);
+@endcode
+Инициализируем список степеней свободы.
+ @code
+        domain.dof_init (fe);
+@endcode
+
+ Это система уровнений для задачи на ячейке (в ней n векторов решения и правой стороны, в данном случае по два) она будет решаться.
+ @code
+        OnCell::SystemsLinearAlgebraicEquations<2> slae;
+@endcode
+
+Заменитель "черных" индексов на "белыет", то есть виртуальных точек на реальные. Необходим для закручивания границ.
+ @code
+        OnCell::BlackOnWhiteSubstituter bows;
+@endcode
+
+ Подготовка СЛАУ для задачи на ячейке.
+@code
+        OnCell::prepare_system_equations (slae, bows, domain);
+@endcode
+
+Задаём елемент матрици жескости, то есть то из чего будет состоять матрица.
+ @code
+        LaplacianScalar<2> element_matrix (domain.dof_handler.get_fe());
+@endcode
+
+Задаём коэффициент теплопроводности.
+ @code
+        {
+            arr<arr<vec<dbl>, 2>, 2> coef;
+            coef[x][x] .push_back (1.0);
+            coef[y][y] .push_back (1.0);
+            coef[x][y] .push_back (0.0);
+            coef[y][x] .push_back (0.0);
+            coef[x][x] .push_back (2.0);
+            coef[y][y] .push_back (2.0);
+            coef[x][y] .push_back (0.0);
+            coef[y][x] .push_back (0.0);
+            HCPTools ::set_thermal_conductivity<2> (element_matrix.C, coef);  
+        };
+@endcode
+
+Ассемблируем матрицу.
+ @code
+        OnCell::Assembler::assemble_matrix<2> (slae.matrix, element_matrix, domain.dof_handler, bows);
+@endcode
+
+Собираем вектора правых частей для каждой задачи и решаем получившиеся системы уравнений.
+ @code
+        FOR(i, 0, 2)
+        {
+            arr<vec<dbl>, 2> coef_for_rhs;
+            FOR(j, 0, 2)
+            {
+                FOR(k, 0, element_matrix.C.size())
+                {
+                    coef_for_rhs[j] .push_back (element_matrix.C[i][j][k]);
+                };
+            };
+            OnCell::SourceScalar<2> element_rhsv (coef_for_rhs, domain.dof_handler.get_fe()); // элемент вектора правой части для i-ой задачи на ячейке
+            OnCell::Assembler::assemble_rhsv<2> (slae.rhsv[i], element_rhsv, domain.dof_handler, bows); // сборка вектора правой части для i-ой задачи на ячейке
+
+            dealii::SolverControl solver_control (10000, 1e-12);
+            dealii::SolverCG<> solver (solver_control);
+            solver.solve (
+                    slae.matrix,
+                    slae.solution[i],
+                    slae.rhsv[i]
+                    ,dealii::PreconditionIdentity()
+                    ); // решение СЛАУ
+            FOR(j, 0, slae.solution[i].size())
+                slae.solution[i][j] = slae.solution[i][bows.subst (j)]; // придание симетрии решению
+        };
+@endcode
+
+Вывод результатов.
+ @code
+        arr<str, 2> vr = {"temperature_x", "temperature_y"};
+        FOR(i, 0, 2)
+            HCPTools ::print_temperature<2> (slae.solution[i], domain.dof_handler, vr[i]); // вывод температуры в файл
+
+        auto meta_coef = OnCell::calculate_meta_coefficients_scalar<2> (
+                domain.dof_handler, slae.solution, slae.rhsv, coef); // рассчет метакоэффициентов
+        printf("%f %f %f\n", meta_coef[x][x], meta_coef[y][y], meta_coef[x][y]);
+@endcode
+
+ @code
+    return EXIT_SUCCESS;
+}
+ @endcode
+
+ Собирается это всё при помощи \ref main_make_file . Не забуть сначала собрать грид, \ref grid_make_file .
+*/

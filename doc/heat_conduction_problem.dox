@@ -1,0 +1,147 @@
+/*! \page hcp Задача теплопроводности
+ \section hcps1 Необходимые заголовки.
+ Заголовки дила.
+ @code
+#include <deal.II/fe/fe_q.h>
+#include <deal.II/lac/solver_cg.h>
+#include <deal.II/lac/precondition.h>
+ @endcode
+ Заголовки выч ядра.
+ @code
+#include "../../../calculation_core/src/blocks/general/domain/domain.h"
+#include "../../../calculation_core/src/blocks/general/laplacian/scalar/laplacian_scalar.h"
+#include "../../../calculation_core/src/blocks/general/source/scalar/source_scalar.h"
+#include "../../../calculation_core/src/blocks/general/boundary_value/boundary_value.h"
+#include "../../../calculation_core/src/blocks/general/assembler/assembler.h"
+#include "../../../calculation_core/src/blocks/general/system_linear_algebraic_equations/system_linear_algebraic_equations.h"
+#include "../../../calculation_core/src/blocks/general/additional_tools/trivial_prepare_system_equations/trivial_prepare_system_equations.h"
+#include "../../../calculation_core/src/blocks/general/additional_tools/apply_boundary_value/scalar/apply_boundary_value_scalar.h"
+#include "../../../calculation_core/src/blocks/general/geometric_tools/geometric_tools.h"
+#include "../../../calculation_core/src/blocks/special/heat_conduction_problem_tools/heat_conduction_problem_tools.h"
+
+ @endcode
+ 
+ \section hcps2 Дополнительные инструменты.
+ @code
+extern void make_grid(
+        dealii::Triangulation< 2 >&,
+        vec<prmt::Point<2>>,
+        vec<st>);
+ @endcode
+ Это функция для построения триангуляции области описана в файле grid.cpp, а так как он компилируется отдельно, то суда функция только импортируется. \n
+ Второй параметр - точки граници. Третий - номера границ.
+
+ \section hcps3 Собственно сам код.
+ @code
+int main()
+{
+    enum {x, y};
+ @endcode
+ Задаём домен. Это треангуляция и список степеней свободы.
+ @code
+        Domain<2> domain;
+@endcode
+Генерируем триангуляцию, в данном случае области в виде прямоугольника.
+ @code
+        {
+            vec<prmt::Point<2>> boundary_of_segments; // Выходной параметр, полученная граница
+            vec<st> types_boundary_segments; // Выходной параметр, номерация сегментов границы
+            arr<st, 4> types_boundary = {0, 0, 0, 0}; // Номера четырёх границ прямоугольника
+            cst num_segments = 2; // На сколько сегментов надо разбить каждую границу
+            prmt::Point<2> p1(0.0, 0.0); // две диагональные точки прямоугольника
+            prmt::Point<2> p2(1.0, 1.0);
+            GTools::give_rectangle_with_border_condition (
+                    boundary_of_segments, types_boundary_segments, 
+                    types_boundary, num_segments, p1, p2); // Задать пронумерованную (для граничных условий) границу в виде четырёхугольника
+            make_grid (domain.grid, boundary_of_segments, types_boundary_segments); // Состряпать триангуляцию
+            domain.grid.refine_global(1); // Згустить сетку в 2 раза
+        };
+@endcode
+Задаём тип граничных элкментов.
+ @code
+        dealii::FE_Q<2> fe(1);
+@endcode
+Инициализируем список степеней свободы.
+ @code
+        domain.dof_init (fe);
+@endcode
+
+ Это просто система уровнений (матрица, векторо решения, вектор правой части) она будет решаться.
+ @code
+        SystemsLinearAlgebraicEquations slae;
+@endcode
+ Подготовка СЛАУ простейший случай (тупа выделяется память под матрицу и вектора).
+ @code
+        ATools ::trivial_prepare_system_equations (slae, domain);
+@endcode
+
+Задаём елемент матрици жескости, то есть то из чего будет состоять матрица.
+ @code
+        LaplacianScalar<2> element_matrix (domain.dof_handler.get_fe());
+@endcode
+Задаём коэффициент теплопроводности.
+ @code
+        {
+            arr<arr<vec<dbl>, 2>, 2> coef;
+            coef[x][x] .push_back (1.0);
+            coef[y][y] .push_back (1.0);
+            coef[x][y] .push_back (0.0);
+            coef[y][x] .push_back (0.0);
+            HCPTools ::set_thermal_conductivity<2> (element_matrix.C, coef);  
+        };
+@endcode
+
+Задаём функцию теплового источника.
+ @code
+        auto func = [] (dealii::Point<2>) {return -2.0;};
+@endcode
+Задаём элемент вектора правой части.
+ @code
+        SourceScalar<2> element_rhsv (func, domain.dof_handler.get_fe());
+@endcode
+
+Ассемблируем матрицу и вектор.
+ @code
+        Assembler::assemble_matrix<2> (slae.matrix, element_matrix, domain.dof_handler);
+        Assembler::assemble_rhsv<2> (slae.rhsv, element_rhsv, domain.dof_handler);
+@endcode
+
+Задаём граничные условия, тут оно одно.
+ @code
+        vec<BoundaryValueScalar<2>> bound (1);
+        bound[0].function      = [] (const dealii::Point<2> &p) {return p(0) * p(0);}; // функция граничного условия
+        bound[0].boundary_id   = 0; // номер границ к которым применяется это условие
+        bound[0].boundary_type = TBV::Dirichlet; // Тип граничного условия, в данном случае Дирихле
+@endcode
+
+Применяем граничные условия к СЛАУ.
+ @code
+        for (auto b : bound)
+            ATools ::apply_boundary_value_scalar<2> (b) .to_slae (slae, domain);
+@endcode
+
+Решаем систему уравнений. В данном случае используется метод сопреженных градиентов реализованный в диле.
+ @code
+        dealii::SolverControl solver_control (10000, 1e-12);
+        dealii::SolverCG<> solver (solver_control);
+        solver.solve (
+                slae.matrix,
+                slae.solution,
+                slae.rhsv
+                ,dealii::PreconditionIdentity()
+                );
+@endcode
+
+Вывод результатов в файл.
+ @code
+        HCPTools ::print_temperature<2> (slae.solution, domain.dof_handler, "temperature"); // вывод температуры
+        HCPTools ::print_heat_conductions<2> (
+                slae.solution, element_matrix.C, domain, "heat_conductions"); // вывод теплопроводности
+@endcode
+ @code
+    return EXIT_SUCCESS;
+}
+ @endcode
+
+ Собирается это всё при помощи \ref main_make_file . Не забуть сначала собрать грид, \ref grid_make_file .
+*/
